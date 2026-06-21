@@ -1,9 +1,7 @@
-FROM node:14 AS build-deps
+FROM node:16 AS build-deps
 
-# Debian Buster ist archiviert -> apt-Quellen auf archive.debian.org umstellen
-RUN printf 'deb http://archive.debian.org/debian buster main contrib non-free\ndeb http://archive.debian.org/debian-security buster/updates main contrib non-free\n' > /etc/apt/sources.list \
-    && printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99no-check-valid \
-    && apt-get update && apt-get install -y wget
+# Node 16 (Debian Bullseye) -> normale apt-Quellen funktionieren; Node 16 versteht ??= (puppeteer)
+RUN apt-get update && apt-get install -y wget
 
 ENV DOCKERIZE_VERSION=v0.6.1
 RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
