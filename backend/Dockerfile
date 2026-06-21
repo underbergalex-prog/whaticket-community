@@ -1,6 +1,7 @@
-FROM node:16 AS build-deps
+FROM node:16-bullseye AS build-deps
 
-# Node 16 (Debian Bullseye) -> normale apt-Quellen funktionieren; Node 16 versteht ??= (puppeteer)
+# node:16 (ohne Suffix) ist noch Debian buster (archiviert -> apt 404). bullseye-Quellen leben.
+# Node 16 versteht ausserdem ??= (das brach Node 14 in puppeteer-core).
 RUN apt-get update && apt-get install -y wget
 
 ENV DOCKERIZE_VERSION=v0.6.1
