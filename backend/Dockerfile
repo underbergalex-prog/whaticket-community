@@ -1,7 +1,6 @@
-FROM node:16-bullseye AS build-deps
+FROM node:20-bullseye AS build-deps
 
-# node:16 (ohne Suffix) ist noch Debian buster (archiviert -> apt 404). bullseye-Quellen leben.
-# Node 16 versteht ausserdem ??= (das brach Node 14 in puppeteer-core).
+# node:20-bullseye: bullseye-apt lebt; Node 20 hat ??= (puppeteer) UND diagnostics_channel.tracingChannel (lru-cache via whaileys).
 RUN apt-get update && apt-get install -y wget
 
 ENV DOCKERIZE_VERSION=v0.6.1
