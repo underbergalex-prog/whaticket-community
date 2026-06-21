@@ -2,6 +2,7 @@ import { QueryInterface, DataTypes } from "sequelize";
 
 module.exports = {
   up: async (queryInterface: QueryInterface) => {
+    await queryInterface.dropTable("WppKeys").catch(() => undefined);
     await queryInterface.createTable("WppKeys", {
       id: {
         type: DataTypes.INTEGER,
@@ -20,11 +21,11 @@ module.exports = {
         onDelete: "CASCADE"
       },
       type: {
-        type: DataTypes.TEXT,
+        type: DataTypes.STRING,
         allowNull: false
       },
       keyId: {
-        type: DataTypes.TEXT,
+        type: DataTypes.STRING,
         allowNull: false
       },
       value: {
