@@ -85,13 +85,19 @@ const saveMediaFile = async (mediaPayload: MediaPayload): Promise<string> => {
   const randomId = makeRandomId(5);
   const { filename: originalFilename } = mediaPayload;
 
+  const mimeExt = (mediaPayload.mimetype.split("/")[1] || "bin").split(";")[0];
   let filename: string;
   if (!originalFilename) {
-    const [extension] = mediaPayload.mimetype.split("/")[1].split(";");
-    filename = `${randomId}-${new Date().getTime()}.${extension}`;
+    filename = `${randomId}-${new Date().getTime()}.${mimeExt}`;
   } else {
-    const baseName = originalFilename.split(".").slice(0, -1).join(".");
-    const extension = originalFilename.split(".").slice(-1)[0];
+    const dot = originalFilename.lastIndexOf(".");
+    const hasExt = dot > 0;
+    const extension = hasExt ? originalFilename.slice(dot + 1) : mimeExt;
+    const baseName =
+      (hasExt ? originalFilename.slice(0, dot) : originalFilename)
+        .trim()
+        .replace(/^\.+/, "")
+        .replace(/[/\\]/g, "_") || `file-${new Date().getTime()}`;
     filename = `${baseName}.${randomId}.${extension}`;
   }
 
