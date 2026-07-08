@@ -27,8 +27,11 @@ const SendWhatsAppMedia = async ({
       ? formatBody(body as string, ticket.contact)
       : undefined;
 
+    // Empfänger soll den ECHTEN Dateinamen sehen (z. B. CV_Max_Mustermann.pdf),
+    // nicht den von multer generierten Zeitstempel-Namen. Fallback auf filename,
+    // falls originalname ausnahmsweise fehlt.
     const mediaInput = {
-      filename: media.filename,
+      filename: media.originalname || media.filename,
       mimetype: media.mimetype,
       path: media.path
     };
@@ -48,7 +51,7 @@ const SendWhatsAppMedia = async ({
       mediaOptions
     );
 
-    await ticket.update({ lastMessage: body || media.filename });
+    await ticket.update({ lastMessage: body || media.originalname || media.filename });
 
     fs.unlinkSync(media.path);
 
