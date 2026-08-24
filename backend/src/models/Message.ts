@@ -37,9 +37,13 @@ class Message extends Model<Message> {
   @Column(DataType.STRING)
   get mediaUrl(): string | null {
     if (this.getDataValue("mediaUrl")) {
+      // encodeURIComponent: Altbestand enthaelt Dateinamen mit Leerzeichen,
+      // Klammern, Umlauten, # oder % – unkodiert ergibt das kaputte URLs
+      // ("Anhaenge koennen nicht geladen werden"). Neue Dateien sind bereits
+      // normalisiert, fuer die ist das ein No-op.
       return `${process.env.BACKEND_URL}:${
         process.env.PROXY_PORT
-      }/public/${this.getDataValue("mediaUrl")}`;
+      }/public/${encodeURIComponent(String(this.getDataValue("mediaUrl")))}`;
     }
     return null;
   }

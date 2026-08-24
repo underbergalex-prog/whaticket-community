@@ -1,6 +1,7 @@
 import "./bootstrap";
 import "reflect-metadata";
 import "express-async-errors";
+import path from "path";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
@@ -25,7 +26,33 @@ app.use(
 app.use(cookieParser());
 app.use(express.json());
 app.use(Sentry.Handlers.requestHandler());
-app.use("/public", express.static(uploadConfig.directory, { dotfiles: "allow" }));
+// RFC 5987: Prozent-Kodierung fuer den filename*-Parameter in
+// Content-Disposition (UTF-8-Dateinamen, die der Browser korrekt anzeigt).
+const encodeRFC5987 = (value: string): string =>
+  encodeURIComponent(value)
+    .replace(/['()]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+    .replace(/\*/g, "%2A");
+
+app.use(
+  "/public",
+  express.static(uploadConfig.directory, {
+    dotfiles: "allow",
+    setHeaders: (res, filePath) => {
+      // Expliziter Content-Disposition-Header mit ASCII-Fallback und
+      // RFC-5987-filename*: Downloads von Altbestand-Dateien mit
+      // Klammern/Leerzeichen/Umlauten bekommen sonst kaputte Namen.
+      const base = path.basename(filePath);
+      const asciiFallback =
+        base.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_") || "file";
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${asciiFallback}"; filename*=UTF-8''${encodeRFC5987(
+          base
+        )}`
+      );
+    }
+  })
+);
 app.use(routes);
 
 app.use(Sentry.Handlers.errorHandler());

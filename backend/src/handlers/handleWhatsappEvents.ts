@@ -81,23 +81,50 @@ const processLocationMessage = (
   return messagePayload;
 };
 
+// Dateinamen fuer die Ablage auf Platte defensiv normalisieren:
+// Klammern, Leerzeichen, Umlaute & Co. haben Anhaenge im CRM unladbar gemacht
+// ("Reference Lettter(Ojimah Michael).docx"). Auf Platte landet nur noch
+// [A-Za-z0-9._-]; der huebsche Original-Name bleibt separat als Anzeigename
+// (Message.body / Ticket.lastMessage) erhalten.
+export const sanitizeFileNamePart = (part: string): string =>
+  part
+    // Umlaute VOR der NFKD-Zerlegung ersetzen (NFKD macht aus "ü" ein
+    // "u"+Kombizeichen, danach wuerde die Umlaut-Ersetzung nicht mehr greifen)
+    .normalize("NFC")
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/Ä/g, "Ae")
+    .replace(/Ö/g, "Oe")
+    .replace(/Ü/g, "Ue")
+    .replace(/ß/g, "ss")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .replace(/^[._-]+|[._-]+$/g, "");
+
 const saveMediaFile = async (mediaPayload: MediaPayload): Promise<string> => {
   const randomId = makeRandomId(5);
   const { filename: originalFilename } = mediaPayload;
 
-  const mimeExt = (mediaPayload.mimetype.split("/")[1] || "bin").split(";")[0];
+  const mimeExt = sanitizeFileNamePart(
+    (mediaPayload.mimetype.split("/")[1] || "bin").split(";")[0]
+  );
   let filename: string;
   if (!originalFilename) {
     filename = `${randomId}-${new Date().getTime()}.${mimeExt}`;
   } else {
     const dot = originalFilename.lastIndexOf(".");
     const hasExt = dot > 0;
-    const extension = hasExt ? originalFilename.slice(dot + 1) : mimeExt;
+    const extension =
+      sanitizeFileNamePart(
+        hasExt ? originalFilename.slice(dot + 1) : mimeExt
+      ) || "bin";
     const baseName =
-      (hasExt ? originalFilename.slice(0, dot) : originalFilename)
-        .trim()
-        .replace(/^\.+/, "")
-        .replace(/[/\\]/g, "_") || `file-${new Date().getTime()}`;
+      sanitizeFileNamePart(
+        hasExt ? originalFilename.slice(0, dot) : originalFilename
+      ).slice(0, 80) || `file-${new Date().getTime()}`;
     filename = `${baseName}.${randomId}.${extension}`;
   }
 
@@ -150,6 +177,14 @@ const processVcardMessage = async (
   }
 };
 
+// Chat-JID fuer Antworten an den Absender: echte Nummer bevorzugt,
+// LID-Fallback fuer Kontakte ohne aufgeloeste Nummer.
+const getReplyJid = (contactPayload: ContactPayload): string | null => {
+  if (contactPayload.number) return `${contactPayload.number}@c.us`;
+  if (contactPayload.lid) return contactPayload.lid;
+  return null;
+};
+
 const handleQueueLogic = async (
   whatsappId: number,
   messageBody: string,
@@ -180,12 +215,11 @@ const handleQueueLogic = async (
       contactPayload as any
     );
 
+    const replyJid = getReplyJid(contactPayload);
+    if (!replyJid) return;
+
     try {
-      await whatsappProvider.sendMessage(
-        whatsappId,
-        `${contactPayload.number}@c.us`,
-        body
-      );
+      await whatsappProvider.sendMessage(whatsappId, replyJid, body);
     } catch (error) {
       logger.error("Error sending queue greeting message:", error);
     }
@@ -200,14 +234,13 @@ const handleQueueLogic = async (
       contactPayload as any
     );
 
+    const replyJid = getReplyJid(contactPayload);
+    if (!replyJid) return;
+
     const debouncedSentMessage = debounce(
       async () => {
         try {
-          await whatsappProvider.sendMessage(
-            whatsappId,
-            `${contactPayload.number}@c.us`,
-            body
-          );
+          await whatsappProvider.sendMessage(whatsappId, replyJid, body);
         } catch (error) {
           logger.error("Error sending queue options message:", error);
         }
@@ -279,7 +312,10 @@ export const handleMessage = async (
     if (mediaPayload && processedMessage.hasMedia) {
       const filename = await saveMediaFile(mediaPayload);
       messageData.mediaUrl = filename;
-      messageData.body = processedMessage.body || filename;
+      // Anzeigename = Original-Dateiname (mit Klammern/Umlauten), NICHT der
+      // normalisierte Plattenname – der steht nur in mediaUrl.
+      messageData.body =
+        processedMessage.body || mediaPayload.filename || filename;
       const [mediaType] = mediaPayload.mimetype.split("/");
       messageData.mediaType = mediaType;
     }

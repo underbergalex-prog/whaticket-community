@@ -4,6 +4,20 @@ import Ticket from "../../models/Ticket";
 import { whatsappProvider, ProviderMessage } from "../../providers/WhatsApp";
 
 import formatBody from "../../helpers/Mustache";
+import GetWaChatId from "../../helpers/GetWaChatId";
+
+// multer 1.4.2 (busboy 0.x) dekodiert originalname als latin1 – UTF-8-Namen
+// mit Umlauten kommen sonst als Mojibake an ("KÃ¼ndigung.pdf" statt
+// "Kündigung.pdf"). Fuer reine ASCII-Namen ist die Konvertierung ein No-op.
+export const fixLatin1Utf8 = (name: string): string => {
+  if (!name) return name;
+  try {
+    const converted = Buffer.from(name, "latin1").toString("utf8");
+    return converted.includes("�") ? name : converted;
+  } catch {
+    return name;
+  }
+};
 
 interface Request {
   media: Express.Multer.File;
@@ -21,7 +35,7 @@ const SendWhatsAppMedia = async ({
       throw new AppError("ERR_TICKET_NO_WHATSAPP");
     }
 
-    const chatId = `${ticket.contact.number}@${ticket.isGroup ? "g" : "c"}.us`;
+    const chatId = GetWaChatId(ticket.contact, ticket.isGroup);
 
     const hasBody = body
       ? formatBody(body as string, ticket.contact)
@@ -30,8 +44,10 @@ const SendWhatsAppMedia = async ({
     // Empfänger soll den ECHTEN Dateinamen sehen (z. B. CV_Max_Mustermann.pdf),
     // nicht den von multer generierten Zeitstempel-Namen. Fallback auf filename,
     // falls originalname ausnahmsweise fehlt.
+    const displayName = fixLatin1Utf8(media.originalname) || media.filename;
+
     const mediaInput = {
-      filename: media.originalname || media.filename,
+      filename: displayName,
       mimetype: media.mimetype,
       path: media.path
     };
@@ -51,7 +67,7 @@ const SendWhatsAppMedia = async ({
       mediaOptions
     );
 
-    await ticket.update({ lastMessage: body || media.originalname || media.filename });
+    await ticket.update({ lastMessage: body || displayName });
 
     fs.unlinkSync(media.path);
 
