@@ -4,6 +4,7 @@ import Ticket from "../../models/Ticket";
 import { whatsappProvider, ProviderMessage } from "../../providers/WhatsApp";
 
 import formatBody from "../../helpers/Mustache";
+import GetWaChatId from "../../helpers/GetWaChatId";
 
 interface Request {
   body: string;
@@ -20,7 +21,7 @@ const SendWhatsAppMessage = async ({
     throw new AppError("ERR_TICKET_NO_WHATSAPP");
   }
 
-  const chatId = `${ticket.contact.number}@${ticket.isGroup ? "g" : "c"}.us`;
+  const chatId = GetWaChatId(ticket.contact, ticket.isGroup);
 
   try {
     const sentMessage = await whatsappProvider.sendMessage(

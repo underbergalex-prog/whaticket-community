@@ -1,6 +1,7 @@
 import { getIO } from "../../libs/socket";
 import Contact from "../../models/Contact";
 import Ticket from "../../models/Ticket";
+import Message from "../../models/Message";
 import { logger } from "../../utils/logger";
 
 interface ExtraInfo {
@@ -50,6 +51,13 @@ const CreateOrUpdateContactService = async ({
       { where: { contactId: contactByLid.id } }
     );
 
+    // Messages.contactId hat ON DELETE CASCADE – ohne Umhaengen wuerden beim
+    // destroy() alle Nachrichten des Doubletten-Kontakts geloescht.
+    await Message.update(
+      { contactId: contactByNumber.id },
+      { where: { contactId: contactByLid.id } }
+    );
+
     await contactByLid.destroy();
 
     await contactByNumber.update({
@@ -80,8 +88,12 @@ const CreateOrUpdateContactService = async ({
   }
 
   if (contactByLid) {
+    // NIE eine bereits bekannte echte Nummer ueberschreiben: eine spaeter
+    // eintreffende LID-only-Nachricht darf die Nummer nicht "wegklobbern"
+    // (das machte aus echten Kontakten Pseudo-Nummern-Kontakte und
+    // provozierte anschliessend Duplikate).
     await contactByLid.update({
-      number: number || contactByLid.number,
+      number: contactByLid.number || number || null,
       profilePicUrl
     });
 
@@ -91,7 +103,8 @@ const CreateOrUpdateContactService = async ({
 
   const created = await Contact.create({
     name,
-    number,
+    // "" wuerde bei mehreren LID-only-Kontakten den Unique-Index verletzen
+    number: number || null,
     lid,
     profilePicUrl,
     email,

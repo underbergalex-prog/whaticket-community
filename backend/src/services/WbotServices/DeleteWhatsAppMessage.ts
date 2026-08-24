@@ -2,6 +2,7 @@ import AppError from "../../errors/AppError";
 import Message from "../../models/Message";
 import Ticket from "../../models/Ticket";
 import { whatsappProvider } from "../../providers/WhatsApp";
+import GetWaChatId from "../../helpers/GetWaChatId";
 
 const DeleteWhatsAppMessage = async (messageId: string): Promise<Message> => {
   const message = await Message.findByPk(messageId, {
@@ -20,7 +21,7 @@ const DeleteWhatsAppMessage = async (messageId: string): Promise<Message> => {
 
   const { ticket } = message;
 
-  const chatId = `${ticket.contact.number}@${ticket.isGroup ? "g" : "c"}.us`;
+  const chatId = GetWaChatId(ticket.contact, ticket.isGroup);
 
   await whatsappProvider.deleteMessage(
     ticket.whatsappId,

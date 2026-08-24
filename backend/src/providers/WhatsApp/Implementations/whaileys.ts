@@ -503,6 +503,8 @@ type ExtendedKey = WAMessageKey &
     sender_pn: string;
     participantPn: string;
     participant_pn: string;
+    recipientPn: string;
+    recipient_pn: string;
     peerRecipientPn: string;
     peer_recipient_pn: string;
     senderLid: string;
@@ -577,7 +579,13 @@ const convertToContactPayload = async (
   const pnCandidates: (string | undefined)[] = [
     keyExt.senderPn || keyExt.sender_pn,
     keyExt.participantPn || keyExt.participant_pn,
-    keyExt.peerRecipientPn || keyExt.peer_recipient_pn
+    // whaileys setzt bei fromMe-Chats (Nachricht vom eigenen Handy an einen
+    // LID-adressierten Kontakt) die echte Nummer in key.recipientPn –
+    // ohne diesen Kandidaten entstand ein Pseudo-Nummern-Kontakt.
+    keyExt.recipientPn || keyExt.recipient_pn,
+    keyExt.peerRecipientPn || keyExt.peer_recipient_pn,
+    ctx?.senderPn || ctx?.sender_pn,
+    ctx?.participantPn || ctx?.participant_pn
   ];
 
   const preferPn = pnCandidates.find(
@@ -674,10 +682,14 @@ const convertToContactPayload = async (
       ? undefined
       : incomingPushName;
 
+  // WICHTIG: Für @lid-JIDs ohne aufgelöste echte Nummer darf die LID-Ziffernfolge
+  // NIEMALS als Telefonnummer verwendet werden (das erzeugte die Pseudo-Nummern
+  // wie "+161340597477621" und damit doppelte Kontakte/Chats). In dem Fall bleibt
+  // number leer und der Kontakt wird ausschließlich über die LID identifiziert.
   const number =
     (isJidUser(resolvedJid) && decoded?.user) ||
     jidDecode(preferPn || "")?.user ||
-    normalizedJid.split("@")[0];
+    (isLidUser(resolvedJid) ? "" : normalizedJid.split("@")[0]);
 
   const lidValue =
     isLidUser(resolvedJid) && decoded?.user ? `${decoded.user}@lid` : lid;
