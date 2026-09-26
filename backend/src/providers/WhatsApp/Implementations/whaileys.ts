@@ -76,6 +76,17 @@ interface Session extends WASocket {
 const sessions = new Map<number, Session>();
 const stores = new Map<number, Store>();
 
+// Jede init() und jedes removeSession() erhöht die Generation einer Sitzung.
+// Ein Reconnect, der während seiner 3-s-Pause überholt wurde (Session-Reset,
+// neuer Start per QR-Knopf), bricht ab, statt mit den ALTEN Zugangsdaten aus
+// dem Closure-Objekt zurückzukommen und den frischen QR-Socket abzuschießen.
+const sessionGeneration = new Map<number, number>();
+const nextGeneration = (sessionId: number): number => {
+  const gen = (sessionGeneration.get(sessionId) ?? 0) + 1;
+  sessionGeneration.set(sessionId, gen);
+  return gen;
+};
+
 const msgRetryCounterLRU = new LRUCache<string, number>({
   max: 5000,
   ttl: 600 * 1000,
@@ -846,6 +857,7 @@ const getWbot = (sessionId: number): Session => {
 };
 
 const removeSession = async (whatsappId: number): Promise<void> => {
+  nextGeneration(whatsappId);
   await flushPendingCredsSave(whatsappId);
 
   const wbot = sessions.get(whatsappId);
@@ -888,6 +900,7 @@ const removeSession = async (whatsappId: number): Promise<void> => {
 const init = async (whatsapp: Whatsapp): Promise<void> => {
   const sessionId = whatsapp.id;
   const io = getIO();
+  const generation = nextGeneration(sessionId);
 
   const { state } = await useSessionAuthState(whatsapp);
   const store = makeInMemoryStore({ logger: whaileyLogger });
@@ -984,6 +997,12 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
 
     connOptions.agent = new HttpsProxyAgent(proxyUrl);
     connOptions.fetchAgent = new HttpsProxyAgent(proxyUrl);
+  }
+
+  // Während der awaits oben kann ein neuerer Start oder ein Reset gelaufen sein.
+  if (sessionGeneration.get(sessionId) !== generation) {
+    logger.info({ info: "Superseded session init aborted", sessionId });
+    return;
   }
 
   assertUnique(sessionId);
@@ -1121,7 +1140,17 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
         });
 
         await sleep(3000);
-        init(whatsapp);
+
+        // Überholt (Reset/Neustart in der Pause) → dieser Reconnect ist hinfällig.
+        if (sessionGeneration.get(sessionId) !== generation) {
+          logger.info({ info: "Stale reconnect skipped", sessionId });
+          return;
+        }
+        // Frisch aus der DB statt des Closure-Objekts: dessen session-Feld kann
+        // noch die inzwischen verworfenen Zugangsdaten enthalten.
+        const fresh = await Whatsapp.findByPk(sessionId);
+        if (!fresh || sessionGeneration.get(sessionId) !== generation) return;
+        init(fresh);
       }
     }
 
