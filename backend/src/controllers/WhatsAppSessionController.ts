@@ -8,7 +8,9 @@ const store = async (req: Request, res: Response): Promise<Response> => {
   const { whatsappId } = req.params;
   const whatsapp = await ShowWhatsAppService(whatsappId);
 
-  StartWhatsAppSession(whatsapp);
+  // Reiner Start: eine laufende Sitzung wird fortgesetzt, nicht neu gekoppelt
+  // (frischer QR über update bzw. remove + store).
+  StartWhatsAppSession(whatsapp, { fortsetzen: true });
 
   return res.status(200).json({ message: "Starting session." });
 };

@@ -329,6 +329,9 @@ export const handleMessage = async (
       lastMessageText = processedMessage.body || mediaPayload?.filename || "";
     }
 
+    // Auch bei gleichem Text als geändert markieren: sonst schickt Sequelize 5 kein
+    // UPDATE, updatedAt bleibt stehen und der CRM-Poller übersieht die Nachricht.
+    ticket.changed("lastMessage", true);
     await ticket.update({ lastMessage: lastMessageText });
 
     await CreateMessageService({ messageData });

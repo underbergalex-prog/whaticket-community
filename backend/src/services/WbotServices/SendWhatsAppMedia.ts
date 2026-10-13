@@ -67,6 +67,8 @@ const SendWhatsAppMedia = async ({
       mediaOptions
     );
 
+    // Gleicher Text → ohne changed() kein UPDATE, updatedAt bliebe stehen (CRM-Poller).
+    ticket.changed("lastMessage", true);
     await ticket.update({ lastMessage: body || displayName });
 
     fs.unlinkSync(media.path);

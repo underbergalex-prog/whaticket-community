@@ -4,13 +4,14 @@ import {
   ProviderMediaInput,
   ProviderContact,
   SendMessageOptions,
-  SendMediaOptions
+  SendMediaOptions,
+  InitOptions
 } from "./types";
 import { WhatsappWebJsProvider } from "./Implementations/wwebjs";
 import { WhaileysProvider } from "./Implementations/whaileys";
 
 export interface WhatsappProvider {
-  init(whatsapp: Whatsapp): Promise<void>;
+  init(whatsapp: Whatsapp, options?: InitOptions): Promise<void>;
   startWatchdog?(): void;
   removeSession(whatsappId: number): void;
   logout(sessionId: number): Promise<void>;

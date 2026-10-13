@@ -27,12 +27,14 @@ import makeWASocket, {
   fetchLatestWaWebVersion,
   WAVersion,
   ConnectionState,
+  DEFAULT_CONNECTION_CONFIG,
   MessageRetryMap
 } from "whaileys";
 import { LRUCache } from "lru-cache";
 import { Boom } from "@hapi/boom";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import NodeCache from "node-cache";
+import { Op } from "sequelize";
 
 import Whatsapp from "../../../models/Whatsapp";
 import { getIO } from "../../../libs/socket";
@@ -48,7 +50,8 @@ import {
   SendMediaOptions,
   ProviderContact,
   MessageType,
-  MessageAck
+  MessageAck,
+  InitOptions
 } from "../types";
 import { WhatsappProvider } from "../whatsappProvider";
 import { sleep } from "../../../utils/sleep";
@@ -72,6 +75,11 @@ type Store = ReturnType<typeof makeInMemoryStore>;
 interface Session extends WASocket {
   id: number;
   store?: Store;
+  // Verbindungszustand dieses Sockets laut connection.update. Der Wächter startet
+  // einen offenen Socket nie neu und erkennt einen, der seit Minuten geschlossen ist.
+  zustand?: "connecting" | "open" | "close" | "qr";
+  zustandSeit?: number;
+  generation?: number;
 }
 
 const sessions = new Map<number, Session>();
@@ -93,30 +101,75 @@ const nextGeneration = (sessionId: number): number => {
 const lastActivity = new Map<number, number>();
 const touch = (sessionId: number) => lastActivity.set(sessionId, Date.now());
 const lastRestart = new Map<number, number>();
-const pendingRestarts = new Map<number, NodeJS.Timeout>();
+// Geplanter Neustart je Sitzung samt der Generation, für die er gilt.
+const pendingRestarts = new Map<
+  number,
+  { timer: NodeJS.Timeout; generation: number }
+>();
+
+// Neueste creds je Sitzung: das state.creds-Objekt des letzten init (whaileys schreibt
+// es fort) samt der Generation, der es gehört. Neustarts derselben Generation nehmen
+// diese statt der DB-Kopie – die kann nach einem gescheiterten Speichern veraltet oder
+// leer sein (frische Kopplung nach dem Scan weg, Pre-Key-Zähler springen zurück).
+// removeSession (Reset/Abmeldung) verwirft sie.
+const liveCreds = new Map<
+  number,
+  { generation: number; creds: AuthenticationCreds; whatsapp: Whatsapp }
+>();
+
+// Bewusst gestoppte Sitzungen (logout, Abmeldung durch WhatsApp) samt Grund. Wächter und
+// automatische Neustarts lassen sie liegen, bis init() ausdrücklich aufgerufen wird.
+const stoppedSessions = new Map<number, "logout" | "abmeldung">();
+
+// Laufende logout()-Resets je Sitzung. Ein ausdrücklicher Start einer gestoppten Sitzung
+// wartet darauf (höchstens RESET_WARTEN_MS).
+const resetsLaufend = new Map<number, Promise<void>>();
+const RESET_WARTEN_MS = 60_000;
+
+// Unabhängige Kopie (wie aus der DB geladen): der alte Socket berührt den neuen nicht.
+const kopiereCreds = (creds: AuthenticationCreds): AuthenticationCreds =>
+  JSON.parse(JSON.stringify(creds, BufferJSON.replacer), BufferJSON.reviver);
 
 // Neustart nach einem Fehler, mit wachsendem Abstand (max. 2 Min), solange niemand
 // inzwischen neu gestartet hat. Ohne das starb die Schleife bei einem einzigen
 // Datenbank-Timeout dauerhaft (Vorfall 13.10.2026, 04:01).
 const scheduleRestart = (sessionId: number, generation: number, attempt = 0): void => {
-  if (pendingRestarts.has(sessionId)) return;
+  if (stoppedSessions.has(sessionId)) return;
+  const geplant = pendingRestarts.get(sessionId);
+  if (geplant) {
+    if (geplant.generation >= generation) return;
+    // Der geplante Neustart einer überholten Generation täte beim Auslösen nichts (die
+    // Generation passt nicht mehr): ersetzen, statt den Wunsch der aktuellen zu verwerfen.
+    clearTimeout(geplant.timer);
+    pendingRestarts.delete(sessionId);
+  }
   const delay = Math.min(5_000 * 2 ** attempt, 120_000);
   const timer = setTimeout(async () => {
-    pendingRestarts.delete(sessionId);
-    if (sessionGeneration.get(sessionId) !== generation) return;
+    if (pendingRestarts.get(sessionId)?.timer === timer) {
+      pendingRestarts.delete(sessionId);
+    }
+    if (
+      sessionGeneration.get(sessionId) !== generation ||
+      stoppedSessions.has(sessionId)
+    )
+      return;
     try {
       const fresh = await Whatsapp.findByPk(sessionId);
       if (!fresh || fresh.status === "DISCONNECTED") return;
-      if (sessionGeneration.get(sessionId) !== generation) return;
+      if (
+        sessionGeneration.get(sessionId) !== generation ||
+        stoppedSessions.has(sessionId)
+      )
+        return;
       lastRestart.set(sessionId, Date.now());
       // eslint-disable-next-line @typescript-eslint/no-use-before-define
-      await init(fresh);
+      await init(fresh, { credsVonGeneration: generation });
     } catch (err) {
       logger.error({ info: "Restart after error failed, retrying", sessionId, attempt, err });
       scheduleRestart(sessionId, sessionGeneration.get(sessionId) ?? generation, attempt + 1);
     }
   }, delay);
-  pendingRestarts.set(sessionId, timer);
+  pendingRestarts.set(sessionId, { timer, generation });
 };
 
 const msgRetryCounterLRU = new LRUCache<string, number>({
@@ -257,37 +310,100 @@ const assertUnique = (sessionId: number) => {
   }
 };
 
+// Wartet höchstens ms, danach undefined (der Aufruf läuft im Hintergrund aus).
+const mitZeitlimit = <T>(
+  promise: Promise<T>,
+  ms: number
+): Promise<T | undefined> =>
+  new Promise(resolve => {
+    const timer = setTimeout(() => resolve(undefined), ms);
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(undefined);
+      }
+    );
+  });
+
+// true = gespeichert. Fehler werden nur geloggt; der Aufrufer merkt sie erneut vor.
+// nurSession: nur die creds, ohne status CONNECTED (Neustart vor open).
 const saveSessionCreds = async (
   whatsapp: Whatsapp,
-  creds: AuthenticationCreds
-) => {
+  creds: AuthenticationCreds,
+  nurSession = false
+): Promise<boolean> => {
   try {
-    await whatsapp.update({
-      session: JSON.stringify(creds, BufferJSON.replacer),
-      status: "CONNECTED",
-      qrcode: ""
-    });
+    const session = JSON.stringify(creds, BufferJSON.replacer);
+    // Statisch und nur, solange die Zeile nicht DISCONNECTED ist: eine verspätet landende
+    // Speicherung (hängende Abfrage, Sequelize-Wiederholung desselben SQL) belebt eine
+    // zurückgesetzte bzw. abgemeldete Sitzung nicht wieder (status CONNECTED, alte creds).
+    // Jeder Start schreibt vorher OPENING bzw. qrcode. Statisch entfällt zudem das
+    // Dirty-Flag-Rennen der gemeinsamen Instanz.
+    const [anzahl] = await Whatsapp.update(
+      nurSession ? { session } : { session, status: "CONNECTED", qrcode: "" },
+      { where: { id: whatsapp.id, status: { [Op.ne]: "DISCONNECTED" } } }
+    );
 
     logger.debug({
-      info: "Creds saved to database",
+      info: anzahl
+        ? "Creds saved to database"
+        : "Creds not saved, session is DISCONNECTED",
       whatsappId: whatsapp.id
     });
+    return true;
   } catch (err) {
     logger.error({
       info: "Error saving creds to database",
       whatsappId: whatsapp.id,
       err
     });
+    return false;
   }
 };
 
+const CREDS_RETRY_MS = 15_000;
+// Höchstens so lange auf die vorige Speicherung warten: eine hängende Abfrage (es gibt
+// keinen Query-Timeout) blockierte sonst alle folgenden und den Reconnect dahinter.
+const CREDS_KETTE_WARTEN_MS = 30_000;
 const credsDebounceTimers = new Map<number, NodeJS.Timeout>();
+// generation: welcher init die creds gehören. Ein Stand überholter Generationen
+// (Reset, Neustart mit DB-creds) wird nicht mehr geschrieben.
 const pendingCredsSaves = new Map<
   number,
-  { whatsapp: Whatsapp; creds: AuthenticationCreds }
+  {
+    whatsapp: Whatsapp;
+    creds: AuthenticationCreds;
+    generation: number;
+    nurSession?: boolean;
+  }
 >();
+// Laufende Speicherung je Sitzung; die nächste wartet auf sie. Parallel konnte ein
+// langsames älteres UPDATE nach einem neueren landen (DB behielt den alten Stand),
+// oder das fertige ältere setzte die Dirty-Flags der gemeinsamen Instanz zurück und
+// das neuere schrieb gar nicht, meldete aber Erfolg. pending.creds ist das Live-Objekt:
+// der zuletzt laufende Schreibvorgang trägt damit immer den neuesten Stand.
+const credsSaveKette = new Map<number, Promise<void>>();
 
-const flushPendingCredsSave = async (sessionId: number): Promise<void> => {
+const armCredsTimer = (sessionId: number, delayMs: number) => {
+  const existingTimer = credsDebounceTimers.get(sessionId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(() => {
+    credsDebounceTimers.delete(sessionId);
+    // eslint-disable-next-line no-use-before-define
+    flushPendingCredsSave(sessionId);
+  }, delayMs);
+
+  credsDebounceTimers.set(sessionId, timer);
+};
+
+const credsEinmalSpeichern = async (sessionId: number): Promise<void> => {
   const existingTimer = credsDebounceTimers.get(sessionId);
   if (existingTimer) {
     clearTimeout(existingTimer);
@@ -295,41 +411,120 @@ const flushPendingCredsSave = async (sessionId: number): Promise<void> => {
   }
 
   const pending = pendingCredsSaves.get(sessionId);
-  if (pending) {
-    pendingCredsSaves.delete(sessionId);
-    await saveSessionCreds(pending.whatsapp, pending.creds);
+  if (!pending) return;
+  pendingCredsSaves.delete(sessionId);
+  if (sessionGeneration.get(sessionId) !== pending.generation) return;
+
+  if (
+    await saveSessionCreds(pending.whatsapp, pending.creds, pending.nurSession)
+  ) {
+    return;
   }
+
+  // Gescheitert (z. B. DB-Timeout): vorgemerkt lassen und später erneut versuchen.
+  // Früher war der Eintrag schon vor dem await gelöscht – der Stand war für immer weg.
+  if (
+    pendingCredsSaves.has(sessionId) ||
+    sessionGeneration.get(sessionId) !== pending.generation
+  ) {
+    return;
+  }
+  pendingCredsSaves.set(sessionId, pending);
+  if (!credsDebounceTimers.has(sessionId)) {
+    armCredsTimer(sessionId, CREDS_RETRY_MS);
+  }
+};
+
+// Den Live-Stand der laufenden Generation (erneut) vormerken, nur session.
+const liveStandNachziehen = (sessionId: number): void => {
+  const live = liveCreds.get(sessionId);
+  if (
+    !live ||
+    live.generation !== sessionGeneration.get(sessionId) ||
+    pendingCredsSaves.has(sessionId)
+  ) {
+    return;
+  }
+  pendingCredsSaves.set(sessionId, {
+    whatsapp: live.whatsapp,
+    creds: live.creds,
+    generation: live.generation,
+    nurSession: true
+  });
+  armCredsTimer(sessionId, 0);
+};
+
+// Hängt sich hinter eine laufende Speicherung derselben Sitzung (credsSaveKette).
+const flushPendingCredsSave = (sessionId: number): Promise<void> => {
+  const vorige = credsSaveKette.get(sessionId);
+  const warten = vorige
+    ? mitZeitlimit(
+        vorige.then(() => true),
+        CREDS_KETTE_WARTEN_MS
+      )
+    : Promise.resolve(true);
+  const lauf = warten
+    .then(gewartet => {
+      if (!gewartet && vorige) {
+        // Zeitlimit: die vorige Abfrage läuft weiter und kann NACH dieser landen (älterer
+        // Stand). Sobald sie endet, den Live-Stand noch einmal schreiben – so landet der
+        // neueste zuletzt. Gestoppte Sitzungen haben keinen Live-Stand mehr.
+        vorige.then(() => liveStandNachziehen(sessionId));
+      }
+      return credsEinmalSpeichern(sessionId);
+    })
+    .catch(err => {
+      logger.error({ info: "Error flushing creds", sessionId, err });
+    });
+  credsSaveKette.set(sessionId, lauf);
+  lauf.then(() => {
+    if (credsSaveKette.get(sessionId) === lauf) {
+      credsSaveKette.delete(sessionId);
+    }
+  });
+  return lauf;
 };
 
 const debouncedSaveCreds = (
   whatsapp: Whatsapp,
   creds: AuthenticationCreds,
+  generation: number,
+  nurSession: boolean,
   delayMs = 1000
 ) => {
-  const sessionId = whatsapp.id;
+  // Spätes creds.update eines ersetzten Sockets verdrängt nicht den aktuellen Eintrag.
+  if (sessionGeneration.get(whatsapp.id) !== generation) return;
+  pendingCredsSaves.set(whatsapp.id, {
+    whatsapp,
+    creds,
+    generation,
+    nurSession
+  });
+  armCredsTimer(whatsapp.id, delayMs);
+};
 
+// Reset/Abmeldung: Vorgemerktes verwerfen, statt es danach doch noch (samt
+// status CONNECTED) in die DB zu schreiben und die alte Sitzung wiederzubeleben.
+const discardPendingCreds = (sessionId: number): void => {
   const existingTimer = credsDebounceTimers.get(sessionId);
   if (existingTimer) {
     clearTimeout(existingTimer);
-  }
-
-  pendingCredsSaves.set(sessionId, { whatsapp, creds });
-
-  const timer = setTimeout(() => {
     credsDebounceTimers.delete(sessionId);
-    pendingCredsSaves.delete(sessionId);
-    saveSessionCreds(whatsapp, creds);
-  }, delayMs);
-
-  credsDebounceTimers.set(sessionId, timer);
+  }
+  pendingCredsSaves.delete(sessionId);
 };
 
-const useSessionAuthState = async (whatsapp: Whatsapp) => {
+const useSessionAuthState = async (
+  whatsapp: Whatsapp,
+  credsAusSpeicher?: AuthenticationCreds
+) => {
   const sessionId = whatsapp.id;
 
-  const creds = whatsapp.session
-    ? JSON.parse(whatsapp.session, BufferJSON.reviver)
-    : initAuthCreds();
+  const creds =
+    credsAusSpeicher ??
+    (whatsapp.session
+      ? JSON.parse(whatsapp.session, BufferJSON.reviver)
+      : initAuthCreds());
 
   return {
     state: {
@@ -890,7 +1085,11 @@ const getWbot = (sessionId: number): Session => {
 
 const removeSession = async (whatsappId: number): Promise<void> => {
   nextGeneration(whatsappId);
-  await flushPendingCredsSave(whatsappId);
+  // Alle Aufrufer setzen zurück (logout, Abmeldung, Löschen): weder vorgemerkte noch
+  // Speicher-creds dürfen die Sitzung danach wiederbeleben ("Alte Sitzung verwerfen"
+  // muss einen frischen QR liefern).
+  discardPendingCreds(whatsappId);
+  liveCreds.delete(whatsappId);
 
   const wbot = sessions.get(whatsappId);
   if (wbot) {
@@ -929,13 +1128,223 @@ const removeSession = async (whatsappId: number): Promise<void> => {
   stores.delete(whatsappId);
 };
 
-const init = async (whatsapp: Whatsapp): Promise<void> => {
+const WA_VERSION_TIMEOUT_MS = 10_000;
+
+const zustandMerken = (
+  wbot: Session,
+  update: Partial<ConnectionState>
+): void => {
+  let { zustand } = wbot;
+  if (update.connection) zustand = update.connection;
+  else if (update.qr) zustand = "qr";
+  if (zustand !== wbot.zustand) {
+    wbot.zustand = zustand;
+    wbot.zustandSeit = Date.now();
+  }
+};
+
+// Abmeldungen (durch WhatsApp oder bewusst) brauchen einen neuen QR; nach allen
+// anderen Schließ-Codes verbindet der close-Handler neu.
+const sollNeuVerbinden = (update: Partial<ConnectionState>): boolean => {
+  const error = update.lastDisconnect?.error;
+  const statusCode = (error as Boom)?.output?.statusCode;
+  const errorMessage =
+    (error as Boom)?.output?.payload?.message ||
+    (error as Error)?.message ||
+    "";
+  return (
+    errorMessage !== "Intentional Logout" &&
+    statusCode !== DisconnectReason.loggedOut
+  );
+};
+
+// DISCONNECTED nach einer Abmeldung bzw. einem logout (dann auch session "") in die DB
+// bringen. Scheitert das Schreiben, wird NUR das Schreiben wiederholt – kein init: die
+// creds sind ungültig, ein Neustart versuchte sonst alle paar Sekunden einen Login mit
+// ihnen. generation = Stand direkt nach removeSession. false = gescheitert (Wiederholung
+// läuft), true = geschrieben oder inzwischen hinfällig.
+const disconnectedSpeichern = async (
+  sessionId: number,
+  generation: number | undefined,
+  sessionLeeren = false,
+  attempt = 0
+): Promise<boolean> => {
+  // Inzwischen ausdrücklich neu gestartet (QR-Knopf) → dessen Status nicht überschreiben.
+  const giltNoch = () =>
+    stoppedSessions.has(sessionId) &&
+    sessionGeneration.get(sessionId) === generation;
+  if (!giltNoch()) return true;
+  try {
+    // Vorgemerktes ist verworfen (removeSession); eine noch laufende creds-Speicherung soll
+    // nicht danach landen (höchstens CREDS_KETTE_WARTEN_MS; landet sie später, verhindert
+    // saveSessionCreds das Wiederbeleben).
+    await flushPendingCredsSave(sessionId);
+    // Das Warten kann lange dauern: erneut prüfen.
+    if (!giltNoch()) return true;
+    await Whatsapp.update(
+      sessionLeeren
+        ? { status: "DISCONNECTED", qrcode: "", session: "", retries: 0 }
+        : { status: "DISCONNECTED", qrcode: "", retries: 0 },
+      { where: { id: sessionId } }
+    );
+  } catch (err) {
+    logger.error({
+      info: "Could not persist DISCONNECTED, retrying",
+      sessionId,
+      attempt,
+      err
+    });
+    setTimeout(() => {
+      disconnectedSpeichern(sessionId, generation, sessionLeeren, attempt + 1);
+    }, Math.min(5_000 * 2 ** attempt, 120_000));
+    return false;
+  }
+  try {
+    const updatedWhatsapp = await Whatsapp.findByPk(sessionId);
+    if (updatedWhatsapp) {
+      getIO().emit("whatsappSession", {
+        action: "update",
+        session: updatedWhatsapp
+      });
+    }
+  } catch (err) {
+    logger.warn({ info: "Could not emit DISCONNECTED", sessionId, err });
+  }
+  if (sessionLeeren) await clearSessionKeys(sessionId);
+  return true;
+};
+
+// Socket offen, DB-Status hängt (z. B. CONNECTED-Schreiben gescheitert). Best effort;
+// geändert wird nur, wenn noch der gelesene Status drinsteht (ein logout gewinnt).
+const statusReparieren = async (
+  w: Whatsapp,
+  anlass: "watchdog" | "start"
+): Promise<void> => {
+  try {
+    await flushPendingCredsSave(w.id);
+    await Whatsapp.update(
+      { status: "CONNECTED", qrcode: "", retries: 0 },
+      { where: { id: w.id, status: w.status } }
+    );
+    const updatedWhatsapp = await Whatsapp.findByPk(w.id);
+    if (updatedWhatsapp) {
+      getIO().emit("whatsappSession", {
+        action: "update",
+        session: updatedWhatsapp
+      });
+    }
+    logger.warn({
+      info: "Repaired status of open session",
+      anlass,
+      sessionId: w.id,
+      status: w.status
+    });
+  } catch (err) {
+    logger.error({
+      info: "Could not repair status of open session",
+      anlass,
+      sessionId: w.id,
+      err
+    });
+  }
+};
+
+interface InitOptionen extends InitOptions {
+  // Gesetzt bei automatischen Neustarts (close-Handler, scheduleRestart, Wächter) = die
+  // Generation, deren Socket ersetzt wird. Hat sich seitdem nichts getan, laufen deren
+  // creds aus dem Speicher weiter statt der evtl. veralteten DB-Kopie.
+  credsVonGeneration?: number;
+}
+
+const init = async (
+  whatsapp: Whatsapp,
+  optionen: InitOptionen = {}
+): Promise<void> => {
+  const { credsVonGeneration, fortsetzen = false } = optionen;
   const sessionId = whatsapp.id;
+  const automatisch = credsVonGeneration !== undefined;
+  const stoppGrund = stoppedSessions.get(sessionId);
+  const gestoppt = stoppGrund !== undefined;
+  if (automatisch && gestoppt) {
+    logger.info({ info: "Restart of stopped session skipped", sessionId });
+    return;
+  }
+  // Reiner Start (POST /whatsappsession, auch von der CRM-Gesundheitsprüfung bei
+  // hängendem DB-Status): eine offene, aktuelle Verbindung bleibt stehen, nur der
+  // Status wird repariert. Ein Neustart nähme sonst die creds aus der DB – nach einem
+  // gescheiterten Speichern ohne Kopplung bzw. mit zurückgesprungenen Pre-Key-Zählern.
+  const sock = sessions.get(sessionId);
+  if (
+    fortsetzen &&
+    !gestoppt &&
+    sock?.zustand === "open" &&
+    sock.generation === sessionGeneration.get(sessionId)
+  ) {
+    logger.info({ info: "Start skipped, session already open", sessionId });
+    await statusReparieren(whatsapp, "start");
+    return;
+  }
+  // Einen laufenden logout-Reset abwarten (der Stopp bleibt so lange stehen, Wächter und
+  // Neustarts warten mit), statt mittendrin zu starten.
+  const reset = gestoppt ? resetsLaufend.get(sessionId) : undefined;
+  if (reset) await mitZeitlimit(reset, RESET_WARTEN_MS);
+  // Nach einem logout ist die Kopplung verworfen (logout schreibt session ""): mit frischen
+  // creds starten. Die Zeile des Aufrufers kann VOR dem Reset gelesen sein (Start-POST im
+  // logout-Fenster: zweiter Tab, CRM-Gesundheitsprüfung), mit ihren creds lebte die eben
+  // verworfene Kopplung wieder auf ("Alte Sitzung verwerfen" ohne frischen QR).
+  const frischeCreds = stoppGrund === "logout" ? initAuthCreds() : undefined;
+  // Ein ausdrücklicher Start (QR-Knopf, Serverstart) hebt einen Stopp auf.
+  stoppedSessions.delete(sessionId);
   const io = getIO();
+  // Fortsetzen ohne offenen Socket: die creds der laufenden Generation. Die DB-Kopie ist
+  // nie neuer (alles Gespeicherte stammt von hier, removeSession verwirft die
+  // Speicher-creds), kann aber älter oder leer sein. PUT (session "") und Starts nach einer
+  // Abmeldung nehmen die DB-Kopie, nach einem logout frische creds; der Serverstart setzt
+  // fortsetzen (ohne Speicherstand ebenfalls die DB-Kopie, nach einem Wächter-Neustart
+  // dessen Stand).
+  const vonGeneration =
+    fortsetzen && !gestoppt
+      ? sessionGeneration.get(sessionId)
+      : credsVonGeneration;
+  const speicher = liveCreds.get(sessionId);
+  const credsAusSpeicher =
+    vonGeneration !== undefined &&
+    speicher &&
+    speicher.generation === vonGeneration &&
+    sessionGeneration.get(sessionId) === vonGeneration
+      ? kopiereCreds(speicher.creds)
+      : undefined;
   const generation = nextGeneration(sessionId);
   touch(sessionId);
+  // Ein geplanter Neustart einer Vorgänger-Generation täte nichts mehr; er soll den
+  // Wächter nicht blockieren.
+  const geplant = pendingRestarts.get(sessionId);
+  if (geplant) {
+    clearTimeout(geplant.timer);
+    pendingRestarts.delete(sessionId);
+  }
 
-  const { state } = await useSessionAuthState(whatsapp);
+  const { state } = await useSessionAuthState(
+    whatsapp,
+    credsAusSpeicher ?? frischeCreds
+  );
+  if (sessionGeneration.get(sessionId) === generation) {
+    liveCreds.set(sessionId, { generation, creds: state.creds, whatsapp });
+    if (credsAusSpeicher) {
+      logger.info({ info: "Restarting with in-memory creds", sessionId });
+      // Vorgemerktes der Vorgänger-Generation wird ab jetzt verworfen: den Stand gleich
+      // (mit Wiederholung) sichern statt erst bei open. Sonst bliebe die DB-Kopie bis
+      // dahin veraltet, und ein Start mit DB-creds (Serverstart) verlöre die Kopplung.
+      // Nur session – verbunden ist erst nach open.
+      pendingCredsSaves.set(sessionId, {
+        whatsapp,
+        creds: state.creds,
+        generation,
+        nurSession: true
+      });
+      flushPendingCredsSave(sessionId);
+    }
+  }
   const store = makeInMemoryStore({ logger: whaileyLogger });
   stores.set(sessionId, store);
 
@@ -959,17 +1368,32 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
   }
 
   if (!waVersionToUse) {
-    try {
-      const fetchedVersionData = await fetchLatestWaWebVersion({});
-      if (fetchedVersionData?.version) {
-        waVersionToUse = fetchedVersionData.version;
-        logger.info({
-          info: "Using latest WA Web version",
-          version: waVersionToUse.join(".")
-        });
-      }
-    } catch (e) {
-      logger.warn({ info: "Failed to fetch latest WA version, using default" });
+    // Mit Zeitlimit: axios ohne timeout liess den Reconnect beliebig lange hängen,
+    // der geschlossene Socket blieb in der Map und die Oberfläche zeigte "verbunden".
+    // fetchLatestWaWebVersion wirft nie: bei Fehlern liefert es die eingebaute Version
+    // mit isLatest false und error.
+    const fetchedVersionData = await mitZeitlimit(
+      fetchLatestWaWebVersion({ timeout: WA_VERSION_TIMEOUT_MS }),
+      WA_VERSION_TIMEOUT_MS + 2_000
+    );
+    if (fetchedVersionData?.isLatest) {
+      waVersionToUse = fetchedVersionData.version;
+      logger.info({
+        info: "Using latest WA Web version",
+        version: waVersionToUse.join(".")
+      });
+    } else {
+      // Fehler/Zeitlimit: eingebaute Standardversion. version: undefined würde den
+      // Default in makeWASocket überschreiben ({ ...DEFAULT_CONNECTION_CONFIG, ...config }).
+      waVersionToUse = DEFAULT_CONNECTION_CONFIG.version;
+      logger.warn({
+        info: "Failed to fetch latest WA version, using default",
+        version: waVersionToUse.join("."),
+        grund: fetchedVersionData
+          ? (fetchedVersionData.error as { message?: string } | undefined)
+              ?.message
+          : `Zeitlimit ${WA_VERSION_TIMEOUT_MS + 2_000} ms`
+      });
     }
   }
 
@@ -1038,11 +1462,33 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
     return;
   }
 
+  // Mit Speicher-creds: der ersetzte Socket lief während der awaits weiter (z. B. Login mit
+  // Pre-Key-Upload; whaileys schreibt seine creds fort, sein creds.update wird ab
+  // nextGeneration verworfen). Seinen neuesten Stand übernehmen statt der Kopie vom
+  // Anfang – sonst sprängen die Pre-Key-Zähler zurück, und der nächste Upload
+  // überschriebe Schlüssel gleicher IDs. Danach wird er sofort beendet.
+  if (credsAusSpeicher && speicher) {
+    const neuesterStand = JSON.stringify(speicher.creds, BufferJSON.replacer);
+    if (neuesterStand !== JSON.stringify(state.creds, BufferJSON.replacer)) {
+      Object.assign(state.creds, JSON.parse(neuesterStand, BufferJSON.reviver));
+      pendingCredsSaves.set(sessionId, {
+        whatsapp,
+        creds: state.creds,
+        generation,
+        nurSession: true
+      });
+      flushPendingCredsSave(sessionId);
+    }
+  }
+
   assertUnique(sessionId);
 
   const wbot = makeWASocket(connOptions) as Session;
   wbot.id = sessionId;
   wbot.store = store;
+  wbot.zustand = "connecting";
+  wbot.zustandSeit = Date.now();
+  wbot.generation = generation;
 
   store.bind(wbot.ev);
 
@@ -1050,10 +1496,21 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
 
   wbot.ev.on("creds.update", () => {
     touch(sessionId);
-    debouncedSaveCreds(whatsapp, state.creds);
+    // Nach open nur session (wie früher über die Instanz: CONNECTED stand dort schon):
+    // eine verspätet landende Speicherung überschreibt so keinen neueren Status, etwa
+    // den QR eines Neustarts. Vor open (Kopplung nach dem Scan) weiter mit CONNECTED.
+    debouncedSaveCreds(
+      whatsapp,
+      state.creds,
+      generation,
+      wbot.zustand === "open"
+    );
   });
 
   wbot.ev.on("messages.upsert", async ({ messages, type }) => {
+    // Ein gesunder Socket sendet kaum connection.update/creds.update – Nachrichten
+    // sind sein Lebenszeichen.
+    touch(sessionId);
     messages.forEach(msg => {
       msgCache.save(msg);
       logger.debug({
@@ -1114,46 +1571,30 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
         (lastDisconnect?.error as Error)?.message ||
         "";
 
+      // Abmeldung: Sitzung ZUERST aus dem Speicher nehmen und als gestoppt markieren.
+      // Scheitert danach das DISCONNECTED-Schreiben, wird nur dieses wiederholt –
+      // früher plante der Fehler-Fang einen Neustart mit den ungültigen creds.
       if (errorMessage === "Intentional Logout") {
-        await whatsapp.update({
-          status: "DISCONNECTED",
-          qrcode: "",
-          retries: 0
-        });
-
-        const updatedWhatsapp = await Whatsapp.findByPk(sessionId);
-        if (updatedWhatsapp) {
-          io.emit("whatsappSession", {
-            action: "update",
-            session: updatedWhatsapp
-          });
-        }
+        stoppedSessions.set(sessionId, "logout");
+        await removeSession(sessionId);
 
         logger.info({ info: "Session intentionally logged out", sessionId });
 
+        await disconnectedSpeichern(
+          sessionId,
+          sessionGeneration.get(sessionId)
+        );
         await clearSessionKeys(sessionId);
-
-        await removeSession(sessionId);
         return;
       }
 
       if (statusCode === DisconnectReason.loggedOut) {
-        await whatsapp.update({
-          status: "DISCONNECTED",
-          qrcode: "",
-          retries: 0
-        });
-
-        const updatedWhatsapp = await Whatsapp.findByPk(sessionId);
-        if (updatedWhatsapp) {
-          io.emit("whatsappSession", {
-            action: "update",
-            session: updatedWhatsapp
-          });
-        }
-
+        stoppedSessions.set(sessionId, "abmeldung");
         await removeSession(sessionId);
-
+        await disconnectedSpeichern(
+          sessionId,
+          sessionGeneration.get(sessionId)
+        );
         return;
       }
 
@@ -1194,7 +1635,7 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
           return;
         }
         if (!fresh || sessionGeneration.get(sessionId) !== generation) return;
-        init(fresh).catch(err => {
+        init(fresh, { credsVonGeneration: generation }).catch(err => {
           logger.error({ info: "Reconnect init failed", sessionId, err });
           scheduleRestart(sessionId, sessionGeneration.get(sessionId) ?? generation);
         });
@@ -1202,6 +1643,15 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
     }
 
     if (connection === "open") {
+      // Mit Speicher-creds gestartet: den aktuellen Stand nachziehen (die Sicherung beim
+      // Start kann noch in der Wiederholung hängen).
+      if (credsAusSpeicher) {
+        pendingCredsSaves.set(sessionId, {
+          whatsapp,
+          creds: state.creds,
+          generation
+        });
+      }
       await flushPendingCredsSave(sessionId);
 
       await whatsapp.update({
@@ -1222,6 +1672,10 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
     }
 
     if (qr !== undefined) {
+      // Status bei jedem QR mitschreiben: steht in der Instanz schon "qrcode", liesse
+      // Sequelize ihn weg, und ein dazwischen per Whatsapp.update geschriebener anderer
+      // Status (z. B. ein spätes DISCONNECTED) bliebe stehen, während ein QR läuft.
+      whatsapp.changed("status", true);
       await whatsapp.update({
         qrcode: qr,
         status: "qrcode"
@@ -1238,12 +1692,16 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
 
   wbot.ev.on("connection.update", async update => {
     touch(sessionId);
+    zustandMerken(wbot, update);
     try {
       await handleConnectionUpdate(update);
     } catch (err) {
-      // Z. B. Datenbank-Timeout beim Status-Schreiben: nie die Schleife sterben lassen.
-      logger.error({ info: "connection.update failed, scheduling restart", sessionId, err });
-      if (update.connection === "close") scheduleRestart(sessionId, generation);
+      // Z. B. Datenbank-Timeout beim Status-Schreiben: nie die Schleife sterben lassen –
+      // aber nur nach Schließ-Codes neu starten, nach denen ohnehin neu verbunden wird.
+      logger.error({ info: "connection.update failed", sessionId, err });
+      if (update.connection === "close" && sollNeuVerbinden(update)) {
+        scheduleRestart(sessionId, generation);
+      }
     }
   });
 
@@ -1302,14 +1760,55 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
 };
 
 // Wächter: startet Sitzungen neu, deren Schleife still gestorben ist (kein Socket mehr,
-// oder in OPENING/QR seit Minuten kein Ereignis). DISCONNECTED bleibt unberührt — dort
-// braucht es einen neuen QR-Scan bzw. einen bewussten Start.
+// Socket seit Minuten geschlossen, oder in OPENING/QR seit Minuten kein Ereignis). Ein
+// offener Socket wird nie neu gestartet, nur sein DB-Status repariert. DISCONNECTED und
+// bewusst gestoppte Sitzungen bleiben unberührt — dort braucht es einen neuen QR-Scan
+// bzw. einen bewussten Start.
 const WATCHDOG_INTERVAL_MS = 60_000;
 const STILL_NACH_MS = 3 * 60_000;
 const RESTART_SPERRE_MS = 5 * 60_000;
 let watchdogTimer: NodeJS.Timeout | null = null;
 
+type Befund = "ok" | "reparieren" | "neustart";
+
+const sitzungPruefen = (w: Whatsapp, now: number): Befund => {
+  // Ein geplanter Neustart zählt nur für die aktuelle Generation (der einer überholten
+  // täte beim Auslösen nichts).
+  const geplant = pendingRestarts.get(w.id);
+  if (
+    stoppedSessions.has(w.id) ||
+    (geplant && geplant.generation === sessionGeneration.get(w.id))
+  ) {
+    return "ok";
+  }
+  const status = String(w.status || "").toUpperCase();
+  const sock = sessions.get(w.id);
+  // Offener Socket = Verbindung lebt, auch wenn lange kein Ereignis kam: nie neu
+  // starten, höchstens den hängengebliebenen DB-Status reparieren (nicht, solange
+  // ein neuerer init läuft – der ersetzt diesen Socket gleich).
+  if (sock?.zustand === "open") {
+    const aktuell = sock.generation === sessionGeneration.get(w.id);
+    return status === "CONNECTED" || !aktuell ? "ok" : "reparieren";
+  }
+  if (status === "DISCONNECTED" || !status) return "ok";
+  if (!sock) return "neustart";
+  // Seit Minuten geschlossen und kein neuer Socket: die Reconnect-Kette hängt
+  // (unabhängig davon, was in der DB steht).
+  if (
+    sock.zustand === "close" &&
+    now - (sock.zustandSeit ?? 0) > STILL_NACH_MS
+  ) {
+    return "neustart";
+  }
+  const silentFor = now - (lastActivity.get(w.id) ?? 0);
+  return status !== "CONNECTED" && silentFor > STILL_NACH_MS
+    ? "neustart"
+    : "ok";
+};
+
 const watchdogTick = async (): Promise<void> => {
+  // Wer seit Tick-Beginn neu gestartet oder zurückgesetzt wurde, bleibt unberührt.
+  const generationAmStart = new Map(sessionGeneration);
   let all: Whatsapp[];
   try {
     all = await Whatsapp.findAll();
@@ -1317,22 +1816,45 @@ const watchdogTick = async (): Promise<void> => {
     logger.error({ info: "Watchdog could not read sessions", err });
     return;
   }
-  const now = Date.now();
   for (const w of all) {
-    const status = String(w.status || "").toUpperCase();
-    if (status === "DISCONNECTED" || !status) continue;
-    const hasSocket = sessions.has(w.id);
-    const silentFor = now - (lastActivity.get(w.id) ?? 0);
-    const dead =
-      status === "CONNECTED"
-        ? !hasSocket
-        : !hasSocket || silentFor > STILL_NACH_MS;
-    if (!dead || pendingRestarts.has(w.id)) continue;
+    if (sitzungPruefen(w, Date.now()) === "ok") continue;
+    // Der Stand von findAll() veraltet, während hier nacheinander neu gestartet wird
+    // (und logout() nimmt die Sitzung VOR dem DISCONNECTED-Schreiben aus dem Speicher):
+    // Zeile frisch lesen und direkt vor dem Neustart alles erneut prüfen.
+    let fresh: Whatsapp | null;
+    try {
+      fresh = await Whatsapp.findByPk(w.id);
+    } catch (err) {
+      logger.error({
+        info: "Watchdog could not read session",
+        sessionId: w.id,
+        err
+      });
+      continue;
+    }
+    if (!fresh) continue;
+    const generation = sessionGeneration.get(w.id);
+    if (generation !== generationAmStart.get(w.id)) continue;
+    const now = Date.now();
+    const befund = sitzungPruefen(fresh, now);
+    if (befund === "reparieren") {
+      await statusReparieren(fresh, "watchdog");
+      continue;
+    }
+    if (befund !== "neustart") continue;
     if (now - (lastRestart.get(w.id) ?? 0) < RESTART_SPERRE_MS) continue;
     lastRestart.set(w.id, now);
-    logger.warn({ info: "Watchdog restarts stalled session", sessionId: w.id, status, hasSocket, silentFor });
+    const sock = sessions.get(w.id);
+    logger.warn({
+      info: "Watchdog restarts stalled session",
+      sessionId: w.id,
+      status: fresh.status,
+      hasSocket: !!sock,
+      zustand: sock?.zustand,
+      silentFor: now - (lastActivity.get(w.id) ?? 0)
+    });
     try {
-      await init(w);
+      await init(fresh, { credsVonGeneration: generation ?? 0 });
     } catch (err) {
       logger.error({ info: "Watchdog restart failed", sessionId: w.id, err });
       scheduleRestart(w.id, sessionGeneration.get(w.id) ?? 0);
@@ -1348,40 +1870,55 @@ const startWatchdog = (): void => {
 };
 
 const logout = async (sessionId: number): Promise<void> => {
-  await flushPendingCredsSave(sessionId);
+  // Bewusst gestoppt, und zwar VOR removeSession: sonst startet ein Wächter-Tick oder
+  // geplanter Neustart die Sitzung zwischen removeSession und dem DISCONNECTED-Schreiben
+  // mit den alten creds neu und überholt das frische init danach. Ausdrückliche Starts
+  // warten auf diesen Reset (init).
+  stoppedSessions.set(sessionId, "logout");
+  let resetFertig: () => void = () => undefined;
+  const reset = new Promise<void>(resolve => {
+    resetFertig = resolve;
+  });
+  resetsLaufend.set(sessionId, reset);
 
-  const wbot = sessions.get(sessionId);
+  try {
+    // Vorgemerktes verwerfen statt schreiben: eine volle Speicherung setzte status
+    // CONNECTED, und scheiterte der Reset danach, stünde die tote Sitzung dauerhaft als
+    // CONNECTED da (Wächter und CRM ignorieren sie dann).
+    discardPendingCreds(sessionId);
 
-  if (wbot) {
-    await wbot
-      .logout()
-      .catch(err => logger.error({ info: "Error on logout", sessionId, err }));
-  }
+    const wbot = sessions.get(sessionId);
 
-  await removeSession(sessionId);
+    if (wbot) {
+      await wbot
+        .logout()
+        .catch(err =>
+          logger.error({ info: "Error on logout", sessionId, err })
+        );
+    }
 
-  const whatsapp = await Whatsapp.findByPk(sessionId);
-
-  if (whatsapp) {
-    await whatsapp.update({
-      status: "DISCONNECTED",
-      qrcode: "",
-      session: "",
-      retries: 0
-    });
-
-    const updatedWhatsapp = await Whatsapp.findByPk(sessionId);
-    if (updatedWhatsapp) {
-      getIO().emit("whatsappSession", {
-        action: "update",
-        session: updatedWhatsapp
-      });
+    await removeSession(sessionId);
+    // DISCONNECTED + session "" (wartet auf eine laufende creds-Speicherung, scheitert es,
+    // wird es im Hintergrund wiederholt).
+    let generation = sessionGeneration.get(sessionId);
+    let geschrieben = await disconnectedSpeichern(sessionId, generation, true);
+    // Trotzdem dazwischengerutschter Start (init wartet höchstens RESET_WARTEN_MS): der
+    // Reset gilt, session "" bleibt maßgeblich.
+    if (geschrieben && sessionGeneration.get(sessionId) !== generation) {
+      stoppedSessions.set(sessionId, "logout");
+      await removeSession(sessionId);
+      generation = sessionGeneration.get(sessionId);
+      geschrieben = await disconnectedSpeichern(sessionId, generation, true);
+    }
+    if (!geschrieben) {
+      throw new Error("Logout not persisted yet, retrying in background");
     }
 
     logger.info({ info: "Session logged out", sessionId });
+  } finally {
+    resetFertig();
+    if (resetsLaufend.get(sessionId) === reset) resetsLaufend.delete(sessionId);
   }
-
-  await clearSessionKeys(sessionId);
 };
 
 const sendMessage = async (
