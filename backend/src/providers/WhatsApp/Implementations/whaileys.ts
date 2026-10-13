@@ -26,6 +26,7 @@ import makeWASocket, {
   Browsers,
   fetchLatestWaWebVersion,
   WAVersion,
+  ConnectionState,
   MessageRetryMap
 } from "whaileys";
 import { LRUCache } from "lru-cache";
@@ -85,6 +86,37 @@ const nextGeneration = (sessionId: number): number => {
   const gen = (sessionGeneration.get(sessionId) ?? 0) + 1;
   sessionGeneration.set(sessionId, gen);
   return gen;
+};
+
+// Letztes Lebenszeichen je Sitzung (connection.update, creds.update, Nachrichten).
+// Der Wächter erkennt daran Schleifen, die still gestorben sind.
+const lastActivity = new Map<number, number>();
+const touch = (sessionId: number) => lastActivity.set(sessionId, Date.now());
+const lastRestart = new Map<number, number>();
+const pendingRestarts = new Map<number, NodeJS.Timeout>();
+
+// Neustart nach einem Fehler, mit wachsendem Abstand (max. 2 Min), solange niemand
+// inzwischen neu gestartet hat. Ohne das starb die Schleife bei einem einzigen
+// Datenbank-Timeout dauerhaft (Vorfall 13.10.2026, 04:01).
+const scheduleRestart = (sessionId: number, generation: number, attempt = 0): void => {
+  if (pendingRestarts.has(sessionId)) return;
+  const delay = Math.min(5_000 * 2 ** attempt, 120_000);
+  const timer = setTimeout(async () => {
+    pendingRestarts.delete(sessionId);
+    if (sessionGeneration.get(sessionId) !== generation) return;
+    try {
+      const fresh = await Whatsapp.findByPk(sessionId);
+      if (!fresh || fresh.status === "DISCONNECTED") return;
+      if (sessionGeneration.get(sessionId) !== generation) return;
+      lastRestart.set(sessionId, Date.now());
+      // eslint-disable-next-line @typescript-eslint/no-use-before-define
+      await init(fresh);
+    } catch (err) {
+      logger.error({ info: "Restart after error failed, retrying", sessionId, attempt, err });
+      scheduleRestart(sessionId, sessionGeneration.get(sessionId) ?? generation, attempt + 1);
+    }
+  }, delay);
+  pendingRestarts.set(sessionId, timer);
 };
 
 const msgRetryCounterLRU = new LRUCache<string, number>({
@@ -901,6 +933,7 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
   const sessionId = whatsapp.id;
   const io = getIO();
   const generation = nextGeneration(sessionId);
+  touch(sessionId);
 
   const { state } = await useSessionAuthState(whatsapp);
   const store = makeInMemoryStore({ logger: whaileyLogger });
@@ -1016,6 +1049,7 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
   sessions.set(sessionId, wbot);
 
   wbot.ev.on("creds.update", () => {
+    touch(sessionId);
     debouncedSaveCreds(whatsapp, state.creds);
   });
 
@@ -1070,7 +1104,7 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
     );
   });
 
-  wbot.ev.on("connection.update", async update => {
+  const handleConnectionUpdate = async (update: Partial<ConnectionState>): Promise<void> => {
     const { connection, lastDisconnect, qr } = update;
 
     if (connection === "close") {
@@ -1126,13 +1160,16 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut; // TODO handle other cases
 
       if (shouldReconnect) {
-        await flushPendingCredsSave(sessionId);
-
-        await whatsapp.update({ status: "OPENING" });
-        io.emit("whatsappSession", {
-          action: "update",
-          session: whatsapp
-        });
+        try {
+          await flushPendingCredsSave(sessionId);
+          await whatsapp.update({ status: "OPENING" });
+          io.emit("whatsappSession", {
+            action: "update",
+            session: whatsapp
+          });
+        } catch (err) {
+          logger.error({ info: "Could not persist OPENING, reconnecting anyway", sessionId, err });
+        }
         logger.info({
           info: "Connection closed, reconnecting...",
           sessionId,
@@ -1148,9 +1185,19 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
         }
         // Frisch aus der DB statt des Closure-Objekts: dessen session-Feld kann
         // noch die inzwischen verworfenen Zugangsdaten enthalten.
-        const fresh = await Whatsapp.findByPk(sessionId);
+        let fresh: Whatsapp | null;
+        try {
+          fresh = await Whatsapp.findByPk(sessionId);
+        } catch (err) {
+          logger.error({ info: "Could not load session for reconnect", sessionId, err });
+          scheduleRestart(sessionId, generation);
+          return;
+        }
         if (!fresh || sessionGeneration.get(sessionId) !== generation) return;
-        init(fresh);
+        init(fresh).catch(err => {
+          logger.error({ info: "Reconnect init failed", sessionId, err });
+          scheduleRestart(sessionId, sessionGeneration.get(sessionId) ?? generation);
+        });
       }
     }
 
@@ -1186,6 +1233,17 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
       });
 
       logger.info({ info: "QR Code generated", sessionId });
+    }
+  };
+
+  wbot.ev.on("connection.update", async update => {
+    touch(sessionId);
+    try {
+      await handleConnectionUpdate(update);
+    } catch (err) {
+      // Z. B. Datenbank-Timeout beim Status-Schreiben: nie die Schleife sterben lassen.
+      logger.error({ info: "connection.update failed, scheduling restart", sessionId, err });
+      if (update.connection === "close") scheduleRestart(sessionId, generation);
     }
   });
 
@@ -1241,6 +1299,52 @@ const init = async (whatsapp: Whatsapp): Promise<void> => {
       })
     );
   });
+};
+
+// Wächter: startet Sitzungen neu, deren Schleife still gestorben ist (kein Socket mehr,
+// oder in OPENING/QR seit Minuten kein Ereignis). DISCONNECTED bleibt unberührt — dort
+// braucht es einen neuen QR-Scan bzw. einen bewussten Start.
+const WATCHDOG_INTERVAL_MS = 60_000;
+const STILL_NACH_MS = 3 * 60_000;
+const RESTART_SPERRE_MS = 5 * 60_000;
+let watchdogTimer: NodeJS.Timeout | null = null;
+
+const watchdogTick = async (): Promise<void> => {
+  let all: Whatsapp[];
+  try {
+    all = await Whatsapp.findAll();
+  } catch (err) {
+    logger.error({ info: "Watchdog could not read sessions", err });
+    return;
+  }
+  const now = Date.now();
+  for (const w of all) {
+    const status = String(w.status || "").toUpperCase();
+    if (status === "DISCONNECTED" || !status) continue;
+    const hasSocket = sessions.has(w.id);
+    const silentFor = now - (lastActivity.get(w.id) ?? 0);
+    const dead =
+      status === "CONNECTED"
+        ? !hasSocket
+        : !hasSocket || silentFor > STILL_NACH_MS;
+    if (!dead || pendingRestarts.has(w.id)) continue;
+    if (now - (lastRestart.get(w.id) ?? 0) < RESTART_SPERRE_MS) continue;
+    lastRestart.set(w.id, now);
+    logger.warn({ info: "Watchdog restarts stalled session", sessionId: w.id, status, hasSocket, silentFor });
+    try {
+      await init(w);
+    } catch (err) {
+      logger.error({ info: "Watchdog restart failed", sessionId: w.id, err });
+      scheduleRestart(w.id, sessionGeneration.get(w.id) ?? 0);
+    }
+  }
+};
+
+const startWatchdog = (): void => {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    watchdogTick().catch(err => logger.error({ info: "Watchdog tick failed", err }));
+  }, WATCHDOG_INTERVAL_MS);
 };
 
 const logout = async (sessionId: number): Promise<void> => {
@@ -1562,6 +1666,7 @@ const fetchChatMessages = async (
 
 export const WhaileysProvider: WhatsappProvider = {
   init,
+  startWatchdog,
   removeSession,
   logout,
   sendMessage,
