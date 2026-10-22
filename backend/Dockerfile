@@ -1,6 +1,7 @@
-FROM node:20-bullseye AS build-deps
+FROM node:20-bookworm AS build-deps
 
-# node:20-bullseye: bullseye-apt lebt; Node 20 hat ??= (puppeteer) UND diagnostics_channel.tracingChannel (lru-cache via whaileys).
+# node:20-bookworm: Debian 12 (bullseye-security liefert seit 10/2026 404, der Build brach beim apt-get ab).
+# Node 20 hat ??= (puppeteer) UND diagnostics_channel.tracingChannel (lru-cache via whaileys).
 RUN apt-get update && apt-get install -y wget
 
 ENV DOCKERIZE_VERSION=v0.6.1
@@ -10,8 +11,8 @@ RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSI
 
 RUN apt-get update \
     && apt-get install -y wget gnupg \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list' \
     && apt-get update \
     && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
       --no-install-recommends \
